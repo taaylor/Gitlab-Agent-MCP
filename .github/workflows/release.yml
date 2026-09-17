@@ -1,0 +1,176 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Read release version
+        id: version
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = data["project"]["version"]
+
+          if not re.fullmatch(
+              r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)",
+              version,
+          ):
+              raise SystemExit("Release version must have the form X.Y.Z")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"release_tag=v{version}\n")
+          PY
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Check formatting
+        run: uv run --no-sync ruff format --check .
+
+      - name: Type check
+        run: uv run --no-sync mypy src
+
+      - name: Test
+        run: uv run --no-sync pytest -m "not integration"
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Verify installed wheel
+        run: |
+          uv venv "$RUNNER_TEMP/install-check"
+          uv pip install \
+            --python "$RUNNER_TEMP/install-check/bin/python" \
+            dist/*.whl
+
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/install-check/bin/python" - <<'PY'
+          from importlib.metadata import distribution
+
+          package = distribution("gitlab-agent-mcp")
+          scripts = {
+              entry.name: entry
+              for entry in package.entry_points
+              if entry.group == "console_scripts"
+          }
+          entrypoint = scripts.get("gitlab-agent-mcp")
+
+          if entrypoint is None:
+              raise SystemExit("gitlab-agent-mcp console entry point is missing")
+          if not callable(entrypoint.load()):
+              raise SystemExit("gitlab-agent-mcp entry point is not callable")
+
+          print(
+              f"Installed gitlab-agent-mcp {package.version}; "
+              "console entry point loads successfully"
+          )
+          PY
+
+      - name: Prepare release files
+        run: |
+          cp .env.example dist/gitlab-agent.env.example
+          cp README.md dist/README.md
+          cd dist
+          sha256sum \
+            *.whl \
+            *.tar.gz \
+            gitlab-agent.env.example \
+            README.md \
+            > SHA256SUMS
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: gitlab-agent-mcp-dist
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs:
+      - build
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Download build artifact
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: gitlab-agent-mcp-dist
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+        run: |
+          if git rev-parse --verify "refs/tags/$RELEASE_TAG" > /dev/null 2>&1; then
+            TAG_COMMIT="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $RELEASE_TAG points to another commit."
+              echo "::error::Bump the project version."
+              exit 1
+            fi
+          fi
+
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; skipping publication."
+            exit 0
+          fi
+
+          gh release create \
+            "$RELEASE_TAG" \
+            dist/* \
+            --target "$GITHUB_SHA" \
+            --generate-notes \
+            --title "$RELEASE_TAG"

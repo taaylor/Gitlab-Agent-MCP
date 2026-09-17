@@ -1,0 +1,65 @@
+[build-system]
+requires = ["uv_build==0.12.15"]
+build-backend = "uv_build"
+
+[project]
+name = "gitlab-agent-mcp"
+version = "0.1.0"
+description = "A safe, local MCP server for GitLab merge request workflows"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "aiohttp==3.14.3",
+    "fastmcp==4.0.4",
+    "pydantic==2.13.5",
+    "pydantic-settings==2.15.0",
+]
+
+[project.scripts]
+gitlab-agent-mcp = "gitlab_agent_mcp.main:main"
+
+[dependency-groups]
+dev = [
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.16.8",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require a configured GitLab instance",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+warn_unreachable = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "ASYNC",
+    "B",
+    "E",
+    "F",
+    "I",
+    "N",
+    "RUF",
+    "S",
+    "SIM",
+    "UP",
+]
+ignore = [
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S105", "S106"]
